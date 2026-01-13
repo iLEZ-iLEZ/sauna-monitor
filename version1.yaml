@@ -1,0 +1,219 @@
+esphome:
+  name: sauna-monitor
+  friendly_name: Sauna Monitor
+  on_boot:
+    priority: 600
+    then:
+      - light.turn_on: backlight_led
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+
+# Enable Home Assistant API and OTA for wireless updates
+api:
+ota:
+  - platform: esphome
+
+logger:
+  level: DEBUG
+  logs:
+    graph: ERROR  # Suppress graph warnings while keeping other debug info
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Global Variables
+globals:
+  - id: last_temp
+    type: float
+    initial_value: '0.0'
+  - id: last_update_time
+    type: uint32_t
+    initial_value: '0'
+  - id: temp_rate
+    type: float
+    initial_value: '0.0'
+  # Temperature history buffer (360 points = 30 minutes at 5s intervals)
+  - id: temp_history
+    type: std::vector<float>
+    restore_value: no
+  - id: history_index
+    type: int
+    initial_value: '0'
+  - id: history_count
+    type: int
+    initial_value: '0'
+
+# SPI Configuration
+spi:
+  clk_pin: 7
+  mosi_pin: 6
+
+output:
+  - platform: ledc
+    pin: 22
+    id: backlight_output
+
+light:
+  - platform: binary
+    name: "Screen Backlight"
+    id: backlight_led
+    output: backlight_output
+
+# Demo mode switch - toggle this in Home Assistant!
+switch:
+  - platform: template
+    name: "Demo Mode"
+    id: demo_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# Fonts - using gfonts for automatic downloading
+font:
+  - file: "gfonts://Roboto"
+    id: font_temp
+    size: 50
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 30
+
+# Temperature Sensor with Rate Logic
+one_wire:
+  - platform: gpio
+    pin: 5
+
+sensor:
+  - platform: dallas_temp
+    address: 0x93000000537cb928
+    id: sauna_temp
+    name: "Sauna Temperature"
+    update_interval: 5s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 3
+    on_value:
+      then:
+        - lambda: |-
+            // Initialize vector on first run
+            if (id(temp_history).empty()) {
+              id(temp_history).resize(360, 0.0);
+            }
+            
+            // Store temperature in history buffer
+            id(temp_history)[id(history_index)] = x;
+            id(history_index) = (id(history_index) + 1) % 360;
+            if (id(history_count) < 360) {
+              id(history_count)++;
+            }
+            
+            // Calculate rate of change
+            uint32_t now = millis();
+            if (id(last_update_time) != 0) {
+              float diff_t = (now - id(last_update_time)) / 60000.0;
+              if (diff_t > 0.05) { 
+                id(temp_rate) = (x - id(last_temp)) / diff_t;
+                id(last_temp) = x;
+                id(last_update_time) = now;
+              }
+            } else {
+              id(last_temp) = x;
+              id(last_update_time) = now;
+            }
+
+# Display Engine
+display:
+  - platform: st7789v
+    model: WAVESHARE_1.47IN_172X320
+    cs_pin: 14
+    dc_pin: 15
+    reset_pin: 21
+    rotation: 180
+    data_rate: 20MHz 
+    update_interval: 500ms
+    eightbitcolor: true
+    lambda: |-
+      it.fill(Color::BLACK);
+      
+      // Function to interpolate color based on temperature
+      auto temp_to_color = [](float temp) -> Color {
+        if (temp < 25.0) {
+          return Color(255, 255, 255);  // White
+        } else if (temp < 50.0) {
+          // White to Yellow transition
+          float ratio = (temp - 25.0) / 25.0;
+          return Color(255, 255, (int)(255 * (1.0 - ratio)));
+        } else if (temp < 80.0) {
+          // Yellow to Red transition
+          float ratio = (temp - 50.0) / 30.0;
+          return Color(255, (int)(255 * (1.0 - ratio)), 0);
+        } else {
+          return Color(255, 0, 0);  // Red
+        }
+      };
+      
+      // Draw custom gradient temperature graph
+      if (id(demo_mode).state) {
+        // DEMO MODE: Draw sine wave
+        for (int x = 0; x < 171; x++) {
+          float t = (float)x / 171.0 * 2.0 * 3.14159 * 3;  // 3 complete cycles
+          float temp = 50.0 + 40.0 * sin(t);  // Oscillates between 10 and 90
+          
+          // Map temperature to Y coordinate (inverted because Y increases downward)
+          int y = (int)(320 - ((temp - 20.0) / 80.0 * 320.0));
+          y = std::max(0, std::min(319, y));
+          
+          Color c = temp_to_color(temp);
+          
+          // Draw thicker line (4 pixels) - draw vertical line at each X
+          for (int dy = -2; dy <= 1; dy++) {
+            int draw_y = y + dy;
+            if (draw_y >= 0 && draw_y < 320) {
+              it.draw_pixel_at(x, draw_y, c);
+            }
+          }
+        }
+      } else {
+        // REAL MODE: Draw from temperature history
+        if (id(history_count) > 1) {
+          int start_idx = id(history_count) < 360 ? 0 : id(history_index);
+          
+          for (int i = 1; i < id(history_count) && i < 172; i++) {
+            int idx1 = (start_idx + id(history_count) - i - 1) % 360;
+            int idx2 = (start_idx + id(history_count) - i) % 360;
+            
+            float temp1 = id(temp_history)[idx1];
+            float temp2 = id(temp_history)[idx2];
+            
+            // Map temperature to Y coordinate
+            int y1 = (int)(320 - ((temp1 - 20.0) / 80.0 * 320.0));
+            int y2 = (int)(320 - ((temp2 - 20.0) / 80.0 * 320.0));
+            
+            y1 = std::max(0, std::min(319, y1));
+            y2 = std::max(0, std::min(319, y2));
+            
+            int x = 172 - i;
+            
+            Color c = temp_to_color(temp2);
+            
+            // Draw thick line by drawing 4 parallel lines
+            for (int offset = -1; offset <= 2; offset++) {
+              it.line(x-1, y1 + offset, x, y2 + offset, c);
+            }
+          }
+        }
+      }
+
+      if (id(sauna_temp).has_state()) {
+        // Main Temperature
+        auto t_color = id(sauna_temp).state > 80 ? Color(255, 0, 0) : Color(255, 255, 255);
+        it.printf(86, 50, id(font_temp), t_color, TextAlign::CENTER, "%.1f°C", id(sauna_temp).state);
+        
+        // Rate of Change
+        auto r_color = id(temp_rate) >= 0 ? Color(0, 255, 0) : Color(0, 200, 255);
+        it.printf(86, 290, id(font_small), r_color, TextAlign::CENTER, "%+.1f °C/min", id(temp_rate));
+      } else {
+        it.print(86, 160, id(font_temp), Color(200, 150, 0), TextAlign::CENTER, "INIT...");
+      }
